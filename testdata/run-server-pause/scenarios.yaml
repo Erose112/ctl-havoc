@@ -1,0 +1,25 @@
+compose_project: ctl-vector-main
+scenarios:
+  - name: Server Pause
+    group: container
+    hypothesis: If server is paused, /health times out during the pause and stays 200 for 5s within 30s of unpause.
+    steady: 5s
+    workload: []
+    faults:
+      - id: pause-server
+        type: docker-pause
+        service: server
+        duration: 10s
+    probes:
+      - name: server_health
+        type: http
+        url: http://localhost:8000/health
+        interval: 1s
+        timeout: 500ms
+    assertions:
+      - {phase: before, probe: server_health, always: "status == 200"}
+      - {phase: during, probe: server_health, always: 'err == "timeout"'}
+      - {phase: after, probe: server_health, stable_for: 5s, where: "status == 200", within: 30s}
+    escalation:
+      type: docker-restart
+      service: server

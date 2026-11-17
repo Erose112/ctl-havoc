@@ -1,0 +1,4 @@
+# Phase 1 fixture — Server Pause. compose_project must match `docker compose ls`.
+compose_project: ctl-vector-main
+compose_file: compose.dev.yml
+frequency_hz: 1

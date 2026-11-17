@@ -1,0 +1,6 @@
+# Phase 1: HTTP health checks only; no CONTROL / tares rows required.
+routes:
+  - {method: GET, path: /health}
+  - {method: GET, path: /v1/state}
+  - {method: POST, path: /v1/command, command: STREAM}
+  - {method: POST, path: /v1/status-request}
