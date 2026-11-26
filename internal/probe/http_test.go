@@ -3,11 +3,13 @@ package probe
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -134,6 +136,35 @@ func TestHTTPProbe_Start_Success(t *testing.T) {
 	}
 }
 
+func TestHTTPProbe_Start_JSONBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"message":"The server is alive!"}`)
+	}))
+	defer srv.Close()
+
+	tl := &memTimeline{}
+	p := newHTTP("health", srv.URL, 20*time.Millisecond, time.Second)
+	startProbe(t, p, tl)
+
+	sample := waitSample(t, tl, 2*time.Second)
+	if sample.Err != timeline.ErrNone {
+		t.Fatalf("Err = %v, want ErrNone (msg=%q)", sample.Err, sample.ErrMsg)
+	}
+	if sample.Fields == nil {
+		t.Fatal("Fields is nil")
+	}
+	status, ok := sample.Fields["status"].(int)
+	if !ok || status != http.StatusOK {
+		t.Fatalf("Fields[status] = %#v, want %d", sample.Fields["status"], http.StatusOK)
+	}
+	msg, ok := sample.Fields["message"].(string)
+	if !ok || msg != "The server is alive!" {
+		t.Fatalf("Fields[message] = %#v, want %q", sample.Fields["message"], "The server is alive!")
+	}
+}
+
 func TestHTTPProbe_Start_BodyTooLarge(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -180,7 +211,7 @@ func TestHTTPProbe_Start_Timeout(t *testing.T) {
 	}
 }
 
-func TestHTTPProbe_Start_UnknownError(t *testing.T) {
+func TestHTTPProbe_Start_ConnRefused(t *testing.T) {
 	// Bind and close so the port refuses connections.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -194,8 +225,8 @@ func TestHTTPProbe_Start_UnknownError(t *testing.T) {
 	startProbe(t, p, tl)
 
 	sample := waitSample(t, tl, 2*time.Second)
-	if sample.Err != timeline.ErrUnknown {
-		t.Fatalf("Err = %v, want ErrUnknown (msg=%q)", sample.Err, sample.ErrMsg)
+	if sample.Err != timeline.ErrConnRefused {
+		t.Fatalf("Err = %v, want ErrConnRefused (msg=%q)", sample.Err, sample.ErrMsg)
 	}
 	if sample.ErrMsg == "" {
 		t.Fatal("ErrMsg empty on connection error")
@@ -220,6 +251,8 @@ func TestHTTPProbe_Start_ContextCanceled(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
+	refusedErr := dialRefused(t)
+
 	tests := []struct {
 		name string
 		err  error
@@ -233,6 +266,10 @@ func TestClassify(t *testing.T) {
 		{name: "net timeout", err: &netTimeoutError{timeout: true}, want: timeline.ErrTimeout},
 		{name: "net non-timeout", err: &netTimeoutError{timeout: false}, want: timeline.ErrUnknown},
 		{name: "plain", err: errors.New("boom"), want: timeline.ErrUnknown},
+		{name: "conn refused dial", err: refusedErr, want: timeline.ErrConnRefused},
+		{name: "conn refused wrapped", err: fmt.Errorf("dial: %w", refusedErr), want: timeline.ErrConnRefused},
+		{name: "conn reset", err: syscall.ECONNRESET, want: timeline.ErrConnReset},
+		{name: "conn reset operror", err: &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}, want: timeline.ErrConnReset},
 	}
 
 	for _, tt := range tests {
@@ -242,6 +279,22 @@ func TestClassify(t *testing.T) {
 			}
 		})
 	}
+}
+
+func dialRefused(t *testing.T) error {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	_, err = net.DialTimeout("tcp", addr, time.Second)
+	if err == nil {
+		t.Fatal("expected connection refused")
+	}
+	return err
 }
 
 // timeoutError satisfies os.IsTimeout via Timeout().
