@@ -2,63 +2,361 @@
 
 Status: draft
 
-Related: [Architecture](ARCHITECTURE.md), [Safety](SAFETY.md)
+Related: [Architecture](ARCHITECTURE.md), [Safety](SAFETY.md), [Timers](reference/timers.md), [Fault injection](reference/fault-injection.md), [Scenario schema](reference/scenario-schema.md), [Interlock](reference/interlock.md)
 
-This page covers hold timers, how each inject type is applied and confirmed, and the fault-row catalog. Scenario shape, probes, and assertions are in [Observation](ARCHITECTURE.md#observation). Blind windows, preflight, and abort are in [Safety](SAFETY.md).
+This page is the fault catalog. Hold timers are in [Timers](reference/timers.md). How each inject type is applied and confirmed is in [Fault injection](reference/fault-injection.md). Scenario shape is in [Scenario model](ARCHITECTURE.md#scenario-model). [Probes](reference/scenario-schema.md#probes) and [assertions](reference/scenario-schema.md#checks) are in the scenario schema. Blind windows, preflight, and abort are in [Safety](SAFETY.md).
 
-## Timers
-
-Durations below are the ones the fault rows use. Margins assume a heartbeat can already be a full interval old when the inject starts.
-
-
-| Timer                    | Value                                                                                                                                                                                                         | Hold that clears it                                                                      | Margin                                                                                                                                                                                                                                                                                         |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Node TCP receive timeout | 15s since the last full TCP server packet                                                                                                                                                                     | Short pause and short stall: **5s**. Session-clearing server pause: **25s**              | 5s hold: 5s left when the last packet is already 5s old. 25s pause: the node has closed even if a packet arrived as the pause began, with about 10s of disconnect before unpause. The server heartbeat loop is frozen during a pause, so this row does not wait out the missed-heartbeat timer |
-| Missed-heartbeat timeout | Heartbeat every 5s, ACK timeout 10s, three misses. The session is removed about 20–25s after ACKs stop, and only while the server is scheduled. A discard or a stall does not RST, so this is the slow path   | TCP drop: **45s**. Stall that must reconnect while the hold is still up: **75s**         | 45s is about 20s past session removal, which is when `/v1/state` is trustworthy. 75s also covers the node closing TCP, one DISCOVERY period, and CONFIG, so the new TCP is up about 20s before undo                                                                                            |
-| Firmware watchdog        | 5 min. Firmware restarts it when a packet is dequeued from the TCP receive queue, and when a new connection sends CONFIG. DISCOVERY does not count                                                            | Node-long holds: **6 min**                                                               | About 1 min. The Drop TCP rows can keep DISCOVERY running and still fire this timer                                                                                                                                                                                                            |
-| Reconnect                | One DISCOVERY period (30s) plus VECTOR's 10s deadline for the first CONFIG                                                                                                                                    | `within` on a reconnect assertion: **45s**                                               | Covers a multicast that just went out                                                                                                                                                                                                                                                          |
-| No-reading limit         | Five missed STREAM periods. At 1 Hz that is 5s, suspended for the blind window                                                                                                                                | Default blind-window cap **2 min**. `--long` raises it to **8 min** for `node-long` only | A 45s TCP drop plus reconnect is about 90s. A 75s stall reconnects during the hold. A 6 min hold plus reconnect fits in 8 min. The GUI watchdog trip's absence is not this window                                                                                                              |
-| `withhold_stream`        | Runner delay before STREAM after a session-clearing undo                                                                                                                                                      | Stop/start server uses **10s**. Cap **15s**                                              | Counts toward the blind-window cap                                                                                                                                                                                                                                                             |
-| GUI watchdog             | 10 min with no `/ws/state` client, polled every 5s. The age starts at the last poll that still saw a client, and the trip runs on the first later poll where that age is at least 10 min                    | Drop `/ws/state` and hold the absence: **11 min**                                        | About 1 min. The last sighting can be one poll before the close, and the trip lands on the poll that crosses 10 min. This hold is `node-long`. The stall row restores inside 5 min. A 6 min pause stays inside the 10 min budget |
-| State-client queue       | 64 events, then VECTOR disconnects that client                                                                                                                                                                | Stall `/ws/state` fills it with `POST /v1/status-request`                                | Not measured. The queue grows only after the socket buffers are full. The row caps the stall at 5 min, so it stays in `client`                                                                                                                                                                 |
-| Docker stop grace        | SIGTERM, then SIGKILL after 10s. VECTOR's shutdown path does not run on SIGTERM: uvicorn stops the API, and the main task waits forever. The process dies when uvicorn re-raises the signal or at the SIGKILL | Stop/start server is down for that stop and the following start                          | The blind window of that row has to fit in 2 min. The API is down while node TCP can still be up. The runner records the container exit code                                                                                                                                                   |
-
-
-Which injects open the [blind window](SAFETY.md#pressure-interlock), and for how long it may last, are defined there.
-
-## Fault model
-
-If inject fails, the result is `injection_failed` and `during` / `after` are not judged. `docker-restart` is escalation. Each row is one way of holding one inject. Further checks on that inject are assertions on the same row.
-
-Privileges and the check that the inject took effect:
-
-- **Docker** faults need access to the Compose engine. Pause is confirmed when inspect says paused. Stop is confirmed when the service is not running.
-- **Network** faults run on the Compose host, where HAVOC runs. Every service uses `network_mode: host`, so the rules go in the input and output chains of the Compose host. They need administrator rights and `--allow-host-network`, whichever scenario group they sit in. `network-drop` installs a discard rule; it is confirmed when that rule is present and its counter moves. With `every: N`, it drops every Nth datagram from each node. `network-stall` queues packets of the single TCP `50000` flow that is open at inject, matched on its addresses and ports, and does not RST it. Undo releases the queue, so the held bytes are delivered. New connections pass, including the node's SYN, the server's SYN-ACK, and CONFIG. Matching on connection state is not allowed, because the SYN-ACK of a new connection already counts as established. If HAVOC's queue process dies, the queued flow is dropped, not released. The stall is confirmed when packets are queued and the flow was not reset.
-- `disk-fill` needs write access on the recordings volume only. The inject writes a filler until ENOSPC, and ENOSPC is its confirmation. `duration` then holds the full disk, and undo deletes the filler. MediaMTX writes to the same volume. The volume is a dedicated, size-bounded mount. Filling it does not fill the host disk, and there is no reserve figure to compute. The run directory, the journal, and `events.jsonl` live on a different filesystem. When a disk scenario will run, preflight refuses any other layout. Without `--allow-disk-fill`, `host-disk` scenarios are skipped.
-- `ws-stall` uses the client HAVOC already holds. It is confirmed when that client has stopped reading. Stopping reading does not fill VECTOR's queue at once. `send_text` blocks only when the server's send buffer and the client's receive buffer are full, and at a few KB/s of events the kernel absorbs a stalled reader for far longer than seconds. HAVOC therefore opens its `/ws/state` and `/ws/telemetry/display` clients, including restores, with a small `SO_RCVBUF` set before connect. Uvicorn still buffers about 64 KiB in user space before `send_text` blocks, and the client's `SO_RCVBUF` does not shrink that buffer. Every STATUS emits one `control.updated` event per control, changed or not, so `status-request` every 500ms produces about 2 × the control count in events per second. How long the queue then takes to fill is not measured. Until it is, `until: client_gone` is capped at 5 min, half the GUI watchdog budget. An open stalled client still counts as presence, so a longer stall does not start the GUI watchdog.
-- `ws-drop` closes the `/ws/state` client HAVOC already holds and opens no replacement until undo. It is confirmed when `websockets.clients.state` is 0. Any other open `/ws/state` client keeps the watchdog off, so a count that stays above 0 is `injection_failed`. The only target is `/ws/state`. Undo restores that client. Restoring it rearms the watchdog and leaves controls where ESTOP put them.
+<a id="timers"></a>
+<a id="fault-model"></a>
 
 ## Fault catalog
 
-| Fault                         | Group        | Hypothesis                                                                                                                                                  | Inject                                                                                                | Outcome                                                                                                                                                                                                                                                                                               |
-| ----------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Pause server                  | container    | A 5s pause times out `/health`. Tares, the recording, and a connected node's controls survive.                                                              | `docker-pause` `server`, 5s; after: `POST /v1/status-request`                                         | during: `/health` times out. after: `/health` 200; tare remains; recording stays active; with nodes, fresh STATUS matches `$snapshot`                                                                                                                                                                 |
-| Pause server, session cleared | node-short   | A 25s pause drops the node session inside the firmware watchdog. The node reconnects with `$snapshot`.                                                      | `docker-pause` `server`, 25s                                                                          | after unpause the node reconnects; fresh STATUS matches `$snapshot`                                                                                                                                                                                                                                   |
-| Pause server, node long       | node-long    | A 6 min pause outlasts the firmware watchdog. The node resets, then reconnects.                                                                             | `docker-pause` `server`, 6 min                                                                        | fresh STATUS is `default_state`; `gui_watchdog.trips_total` unchanged. Restore `/ws/state` after `/health` 200 if the pause dropped it                                                                                                                                                                |
-| Pause media                   | container    | Pausing media leaves VECTOR up. Recorded telemetry keeps growing. Video is frozen until unpause.                                                            | `docker-pause` media, 5s                                                                              | `/health` 200; recording stays active; MediaMTX HTTP times out, then answers; video bytes resume after unpause. with nodes: telemetry artifact grows                                                                                                                                                  |
-| Stop/start media              | container    | Stopping media leaves VECTOR up. Live video stays down until cameras are reconnected.                                                                       | `docker-stop` media, 10s                                                                              | `/health` 200; MediaMTX HTTP fails, then answers. after: `POST /v1/cameras/reconnect` lists the cameras                                                                                                                                                                                               |
-| Drop camera IPs               | host-network | Blocking camera addresses leaves VECTOR and MediaMTX up. Video stops growing. Recorded telemetry keeps growing.                                             | `network-drop` camera ONVIF/RTSP, all, 10s                                                            | `/health` 200; MediaMTX 200; recording stays active; video files stop. during: cameras still listed until the reconnect step, which can take 5s or more on the ONVIF timeout; reconnect empties the list. after: reconnect lists them. with nodes: telemetry artifact grows                           |
-| UDP loss, partial             | host-network | Dropping some DATA packets opens gaps, which close when the filter is gone.                                                                                 | `network-drop` UDP `50001`, `every: 2`, 10s                                                           | requires nodes. during: `some_gap` over 1.5s. after: `max_gap` 1.5s                                                                                                                                                                                                                                   |
-| UDP loss, total               | host-network | Dropping every DATA packet stops ingest until the filter is gone.                                                                                           | `network-drop` UDP `50001`, all, 10s                                                                  | requires nodes. during: `quiet_for` while dropped. after: batches resume                                                                                                                                                                                                                              |
-| Stall TCP, brief              | host-network | Holding the established flow for 5s leaves the node session up.                                                                                             | `network-stall` TCP `50000`, 5s; after: `POST /v1/status-request`                                     | requires nodes. during: `connected` stays true. after: fresh STATUS matches `$snapshot`                                                                                                                                                                                                               |
-| Stall TCP, session dropped    | node-short   | Holding that flow for 75s makes VECTOR drop the node session. The node opens a new TCP while the stall still holds. Tares survive.                          | `network-stall` TCP `50000`, 75s                                                                      | old node session drops; fresh STATUS matches `$snapshot`; tare remains                                                                                                                                                                                                                                |
-| Drop TCP `50000`              | host-network | Discarding every TCP `50000` packet, including SYN, for 45s drops the node session. DISCOVERY still runs. The node cannot finish CONFIG.                    | `network-drop` TCP `50000`, all, 45s                                                                  | requires nodes. during: `/v1/state` disconnected within 30s of inject, and stays so until undo. after: the node connects                                                                                                                                                                              |
-| Drop TCP, node long           | node-long    | The same drop held for 6 min fires the firmware watchdog. DISCOVERY does not reset it.                                                                      | `network-drop` TCP `50000`, all, 6 min                                                                | during: disconnected within 30s of inject, and stays so until undo. after: fresh STATUS is `default_state`; `gui_watchdog.trips_total` unchanged                                                                                                                                                      |
-| Drop TCP, command in flight   | node-short   | With TCP already dropped, CONTROL of the test control is never confirmed.                                                                                   | `network-drop` TCP `50000`, 45s; during: CONTROL right after inject                                   | the command is `timed_out`; a later STATUS on the new connection does not complete it                                                                                                                                                                                                                 |
-| Stop/start server             | container    | A stop and start inside the firmware watchdog drops tares and the recording. A connected node reconnects with `$snapshot`. Ingest stays quiet until STREAM. | `docker-stop` `server`; `withhold_stream` 10s                                                         | after: `/health` up; tare gone (known gap); recording idle, and its metadata stays `active` (known gap); a new recording can start. with nodes: fresh STATUS matches `$snapshot`; `quiet_for` in `withhold`, then batches                                                                             |
-| Stop/start with node, long    | node-long    | Six minutes down resets the node. The new process starts the GUI watchdog over.                                                                             | `docker-stop` `server`, down 6 min                                                                    | the node reconnects; fresh STATUS is `default_state`; the new process reports `gui_watchdog.trips_total` 0                                                                                                                                                                                            |
-| Disk full, recording open     | host-disk    | Filling the recordings volume during a recording leaves VECTOR up. CONTROL and raw telemetry keep running. Rows wait in VECTOR's 1 MB buffer until undo.    | `disk-fill`, 30s                                                                                      | `/health` 200; recording stays active. during: the server log contains `Failed to flush telemetry recording`. with nodes: raw telemetry flows; CONTROL confirms; during the hold the telemetry artifact grows by at most one filesystem block. after: the recording can stop, and a new one can start |
-| Disk full, session start      | host-disk    | Starting a recording at ENOSPC fails. VECTOR stays up.                                                                                                      | `disk-fill`, 30s                                                                                      | during: `POST /v1/sessions/start` fails; `/health` 200                                                                                                                                                                                                                                                |
-| Stall `/ws/state`             | client       | A state client that stops draining is disconnected at 64 queued events. Reconnecting promptly does not trip the GUI watchdog.                               | `ws-stall` `/ws/state` `until: client_gone`, cap 5 min; during: `POST /v1/status-request` every 500ms | requires nodes. `websockets.clients.state` becomes 0 before the cap; `gui_watchdog.trips_total` unchanged. after: client restored, `websockets.clients.state` is 1, snapshot received                                                                                                                 |
-| GUI watchdog trip             | node-long    | With the server and the node session still up, an 11 min absence of `/ws/state` makes the GUI watchdog send ESTOP. The test control returns to `default_state`, and restoring the client leaves it there. | `ws-drop` `/ws/state`, 11 min; after: `POST /v1/status-request`                                       | requires nodes. during: `websockets.clients.state` stays 0; the node stays connected; `gui_watchdog.trips_total` rises by 1 from its value at inject; the first ESTOP for that node in `commands.recent` has `state == sent` and `sent_at` after inject. after: client restored, `websockets.clients.state` is 1; fresh STATUS is `default_state` |
-| Stall telemetry WS            | client       | A slow display client loses oldest batches. Ingest and commands keep running.                                                                               | `ws-stall` `/ws/telemetry/display` `until: dropped`, cap 2 min                                        | requires nodes. `telemetry.streams.dropped_batches_total.telemetry_display` increases; `/health` 200; raw telemetry flows; node session stays up; CONTROL confirms                                                                                                                                    |
+| Fault | Group | Hold | One-line hypothesis |
+| --- | --- | --- | --- |
+| Pause server | container | 5s | A 5s pause times out `/health`. Tares, the recording, and controls survive. |
+| Pause server, session cleared | node-short | 25s | A 25s pause drops the session inside the firmware watchdog. The node reconnects with `$snapshot`. |
+| Pause server, node long | node-long | 6 min | A 6 min pause outlasts the firmware watchdog. The node resets, then reconnects. |
+| Pause media | container | 5s | Pausing media leaves VECTOR up. Telemetry keeps growing. Video stays frozen until unpause. |
+| Stop/start media | container | 10s | Stopping media leaves VECTOR up. Live video stays down until cameras are reconnected. |
+| Drop camera IPs | host-network | 10s | Blocking camera addresses leaves VECTOR and MediaMTX up. Video stops. Telemetry keeps growing. |
+| UDP loss, partial | host-network | 10s | Dropping some DATA packets opens gaps, which close when the filter is gone. |
+| UDP loss, total | host-network | 10s | Dropping every DATA packet stops ingest until the filter is gone. |
+| Stall TCP, brief | host-network | 5s | Holding the established flow for 5s leaves the node session up. |
+| Stall TCP, session dropped | node-short | 75s | A 75s hold drops the node session. A new TCP opens during the stall. Tares survive. |
+| Drop TCP `50000` | host-network | 45s | Discarding TCP `50000`, including SYN, for 45s drops the session. DISCOVERY runs. CONFIG cannot finish. |
+| Drop TCP, node long | node-long | 6 min | The same drop held for 6 min fires the firmware watchdog. DISCOVERY does not reset it. |
+| Drop TCP, command in flight | node-short | 45s | With TCP already dropped, CONTROL of the test control is never confirmed. |
+| Stop/start server | container | stop, then start | Stop and start inside the watchdog drops tares and the recording. Reconnect matches `$snapshot`. Ingest stays quiet until STREAM. |
+| Stop/start with node, long | node-long | 6 min | Six minutes down resets the node. The new process starts the GUI watchdog over. |
+| Disk full, recording open | host-disk | 30s | Filling the recordings volume during a recording leaves VECTOR up. CONTROL and raw telemetry keep running. |
+| Disk full, session start | host-disk | 30s | Starting a recording at ENOSPC fails. VECTOR stays up. |
+| Stall `/ws/state` | client | until `client_gone`, cap 5 min | A stalled state client is disconnected at 64 queued events and does not trip the GUI watchdog. |
+| GUI watchdog trip | node-long | 11 min | Server and node session stay up. An 11 min `/ws/state` absence sends ESTOP. The test control returns to `default_state`. |
+| Stall telemetry WS | client | until `dropped`, cap 2 min | A slow display client loses oldest batches. Ingest and commands keep running. |
+
+### Pause server
+
+**Hypothesis.** A 5s pause times out `/health`. Tares, the recording, and a connected node's controls survive.
+
+**Inject.**
+
+- `docker-pause` of `server` for 5s
+- after: `POST /v1/status-request`
+
+**Expected outcome.**
+
+- During: `/health` times out.
+- After: `/health` 200.
+- After: tare remains.
+- After: recording stays active.
+- After: with nodes, fresh STATUS matches `$snapshot`.
+
+### Pause server, session cleared
+
+**Hypothesis.** A 25s pause drops the node session inside the firmware watchdog. The node reconnects with `$snapshot`.
+
+**Inject.**
+
+- `docker-pause` of `server` for 25s
+
+**Expected outcome.**
+
+- After: the node reconnects.
+- After: fresh STATUS matches `$snapshot`.
+
+### Pause server, node long
+
+**Hypothesis.** A 6 min pause outlasts the firmware watchdog. The node resets, then reconnects.
+
+**Inject.**
+
+- `docker-pause` of `server` for 6 min
+
+**Expected outcome.**
+
+- After: fresh STATUS is `default_state`.
+- After: `gui_watchdog.trips_total` is unchanged.
+- After: restore `/ws/state` once `/health` is 200 if the pause dropped it.
+
+### Pause media
+
+**Hypothesis.** Pausing media leaves VECTOR up. Recorded telemetry keeps growing. Video is frozen until unpause.
+
+**Inject.**
+
+- `docker-pause` of media for 5s
+
+**Expected outcome.**
+
+- During: `/health` 200.
+- During: recording stays active.
+- During: MediaMTX HTTP times out.
+- During: with nodes, the telemetry artifact grows.
+- After: MediaMTX HTTP answers.
+- After: video bytes resume.
+
+### Stop/start media
+
+**Hypothesis.** Stopping media leaves VECTOR up. Live video stays down until cameras are reconnected.
+
+**Inject.**
+
+- `docker-stop` of media for 10s
+
+**Expected outcome.**
+
+- During: `/health` 200.
+- During: MediaMTX HTTP fails.
+- After: MediaMTX HTTP answers.
+- After: `POST /v1/cameras/reconnect` lists the cameras.
+
+### Drop camera IPs
+
+**Hypothesis.** Blocking camera addresses leaves VECTOR and MediaMTX up. Video stops growing. Recorded telemetry keeps growing.
+
+**Inject.**
+
+- `network-drop` of camera ONVIF/RTSP, all, for 10s
+
+**Expected outcome.**
+
+- During: `/health` 200.
+- During: MediaMTX 200.
+- During: recording stays active.
+- During: video files stop.
+- During: cameras stay listed until the reconnect step, which can take 5s or more on the ONVIF timeout.
+- During: that reconnect empties the list.
+- During: with nodes, the telemetry artifact grows.
+- After: reconnect lists them.
+
+### UDP loss, partial
+
+**Hypothesis.** Dropping some DATA packets opens gaps, which close when the filter is gone.
+
+**Inject.**
+
+- `network-drop` of UDP `50001`, `every: 2`, for 10s
+
+**Expected outcome.**
+
+- Requires nodes.
+- During: `some_gap` over 1.5s.
+- After: `max_gap` 1.5s.
+
+### UDP loss, total
+
+**Hypothesis.** Dropping every DATA packet stops ingest until the filter is gone.
+
+**Inject.**
+
+- `network-drop` of UDP `50001`, all, for 10s
+
+**Expected outcome.**
+
+- Requires nodes.
+- During: `quiet_for` while dropped.
+- After: batches resume.
+
+### Stall TCP, brief
+
+**Hypothesis.** Holding the established flow for 5s leaves the node session up.
+
+**Inject.**
+
+- `network-stall` of TCP `50000` for 5s
+- after: `POST /v1/status-request`
+
+**Expected outcome.**
+
+- Requires nodes.
+- During: `connected` stays true.
+- After: fresh STATUS matches `$snapshot`.
+
+### Stall TCP, session dropped
+
+**Hypothesis.** Holding that flow for 75s makes VECTOR drop the node session. The node opens a new TCP while the stall still holds. Tares survive.
+
+**Inject.**
+
+- `network-stall` of TCP `50000` for 75s
+
+**Expected outcome.**
+
+- During: the old node session drops.
+- After: fresh STATUS matches `$snapshot`.
+- After: tare remains.
+
+### Drop TCP `50000`
+
+**Hypothesis.** Discarding every TCP `50000` packet, including SYN, for 45s drops the node session. DISCOVERY still runs. The node cannot finish CONFIG.
+
+**Inject.**
+
+- `network-drop` of TCP `50000`, all, for 45s
+
+**Expected outcome.**
+
+- Requires nodes.
+- During: `/v1/state` shows disconnected within 30s of inject, and stays so until undo.
+- After: the node connects.
+
+### Drop TCP, node long
+
+**Hypothesis.** The same drop held for 6 min fires the firmware watchdog. DISCOVERY does not reset it.
+
+**Inject.**
+
+- `network-drop` of TCP `50000`, all, for 6 min
+
+**Expected outcome.**
+
+- During: disconnected within 30s of inject, and stays so until undo.
+- After: fresh STATUS is `default_state`.
+- After: `gui_watchdog.trips_total` is unchanged.
+
+### Drop TCP, command in flight
+
+**Hypothesis.** With TCP already dropped, CONTROL of the test control is never confirmed.
+
+**Inject.**
+
+- `network-drop` of TCP `50000` for 45s
+- during: CONTROL of the test control right after inject
+
+**Expected outcome.**
+
+- During: the command is `timed_out`.
+- After: a later STATUS on the new connection does not complete it.
+
+A POST after the session is gone fails the step instead of producing `timed_out` ([CONTROL confirms](reference/command-allowlist.md#control-confirms)).
+
+### Stop/start server
+
+**Hypothesis.** A stop and start inside the firmware watchdog drops tares and the recording. A connected node reconnects with `$snapshot`. Ingest stays quiet until STREAM.
+
+**Inject.**
+
+- `docker-stop` of `server` (no `duration` or `until`: undo once the stop is confirmed)
+- `withhold_stream` 10s
+
+**Expected outcome.**
+
+- After: `/health` is up.
+- After: tare is gone (known gap).
+- After: recording is idle, and its metadata stays `active` (known gap).
+- After: a new recording can start.
+- After: with nodes, fresh STATUS matches `$snapshot`.
+- After: `quiet_for` in `withhold`, then batches.
+
+**Known gaps.**
+
+- Tares disappear on server stop.
+- Recording metadata stays `active` after the session is idle.
+
+### Stop/start with node, long
+
+**Hypothesis.** Six minutes down resets the node. The new process starts the GUI watchdog over.
+
+**Inject.**
+
+- `docker-stop` of `server`, down 6 min
+
+**Expected outcome.**
+
+- After: the node reconnects.
+- After: fresh STATUS is `default_state`.
+- After: the new process reports `gui_watchdog.trips_total` 0.
+
+### Disk full, recording open
+
+**Hypothesis.** Filling the recordings volume during a recording leaves VECTOR up. CONTROL and raw telemetry keep running. Rows wait in VECTOR's 1 MB buffer until undo.
+
+**Inject.**
+
+- `disk-fill` for 30s
+
+**Expected outcome.**
+
+- During: `/health` 200.
+- During: recording stays active.
+- During: the server log contains `Failed to flush telemetry recording`.
+- During: with nodes, raw telemetry flows.
+- During: with nodes, CONTROL confirms.
+- During: the telemetry artifact grows by at most one filesystem block.
+- After: the recording can stop, and a new one can start.
+
+### Disk full, session start
+
+**Hypothesis.** Starting a recording at ENOSPC fails. VECTOR stays up.
+
+**Inject.**
+
+- `disk-fill` for 30s
+
+**Expected outcome.**
+
+- During: `POST /v1/sessions/start` fails.
+- During: `/health` 200.
+
+### Stall `/ws/state`
+
+**Hypothesis.** A state client that stops draining is disconnected at 64 queued events. Reconnecting promptly does not trip the GUI watchdog.
+
+**Inject.**
+
+- `ws-stall` of `/ws/state`, `until: client_gone`, cap 5 min
+- during: `POST /v1/status-request` every 500ms
+
+**Expected outcome.**
+
+- Requires nodes.
+- During: `websockets.clients.state` becomes 0 before the cap.
+- During: `gui_watchdog.trips_total` is unchanged.
+- During: an open stalled client still counts as presence, so a longer stall does not start the GUI watchdog.
+- After: the client is restored, `websockets.clients.state` is 1, and a snapshot is received.
+
+**Known gaps.**
+
+- How long the queue takes to reach 64 events is not measured ([State-client queue](reference/timers.md#state-client-queue), [ws-stall](reference/fault-injection.md#ws-stall)).
+
+### GUI watchdog trip
+
+**Hypothesis.** With the server and the node session still up, an 11 min absence of `/ws/state` makes the GUI watchdog send ESTOP. The test control returns to `default_state`, and restoring the client leaves it there.
+
+Heartbeats keep feeding the node watchdog. VECTOR's GUI watchdog is what sends ESTOP.
+
+**Inject.**
+
+- `ws-drop` of `/ws/state` for 11 min ([ws-drop](reference/fault-injection.md#ws-drop))
+- after: `POST /v1/status-request`
+- The row uses the same node-outcome setup ([Setup and snapshot](reference/command-allowlist.md#setup-and-snapshot)). Its `default_state` is the watchdog ESTOP on a session that stayed up.
+
+**Expected outcome.**
+
+- Requires nodes.
+- During: `websockets.clients.state` stays 0.
+- During: the node stays connected.
+- During: `gui_watchdog.trips_total` rises by 1 from its value at inject.
+- During: the first ESTOP for that node in `commands.recent` has `state == sent` and `sent_at` after inject ([GUI watchdog trip ESTOP](reference/command-allowlist.md#gui-watchdog-trip-estop)).
+- After: the client is restored and `websockets.clients.state` is 1.
+- After: fresh STATUS is `default_state`.
+- After: restoring the client rearms the watchdog and leaves the controls at `default_state`.
+
+The ESTOP this row provokes opens a blind window. The 11 min absence is not that window. Mechanics are in [Interlock](reference/interlock.md#gui-watchdog-trip).
+
+### Stall telemetry WS
+
+**Hypothesis.** A slow display client loses oldest batches. Ingest and commands keep running.
+
+**Inject.**
+
+- `ws-stall` of `/ws/telemetry/display`, `until: dropped`, cap 2 min
+
+**Expected outcome.**
+
+- Requires nodes.
+- During: `telemetry.streams.dropped_batches_total.telemetry_display` increases.
+- During: `/health` 200.
+- During: raw telemetry flows.
+- During: the node session stays up.
+- During: CONTROL confirms.
